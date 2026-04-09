@@ -2,32 +2,50 @@ import requests
 import json
 import time
 import os
-import re
 from datetime import datetime
 
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "YOUR_APIFY_TOKEN_HERE")
-CITIES = ["Mumbai", "Delhi", "Bangalore"]
+
+# Indian cities with coordinates to force correct location
+CITIES = [
+    {"name": "Mumbai", "lat": 19.0760, "lng": 72.8777},
+    {"name": "Delhi",  "lat": 28.6139, "lng": 77.2090},
+    {"name": "Bangalore", "lat": 12.9716, "lng": 77.5946}
+]
+
 BUSINESS_TYPE = "real estate agency"
 OUTPUT_FILE = "agent_a/leads.json"
 
-def search_google_maps(city, business_type):
-    print(f"[Agent A] Searching: {business_type} in {city}...")
+def search_google_maps(city: dict):
+    print(f"[Agent A] Searching: {BUSINESS_TYPE} in {city['name']} India...")
     url = "https://api.apify.com/v2/acts/compass~crawler-google-places/run-sync-get-dataset-items"
     payload = {
-        "searchStringsArray": [f"{business_type} in {city} India"],
-        "maxCrawledPlacesPerSearch": 40,
+        "searchStringsArray": [f"{BUSINESS_TYPE} in {city['name']} India"],
+        "lat": city["lat"],
+        "lng": city["lng"],
+        "zoom": 12,
+        "maxCrawledPlacesPerSearch": 20,
         "language": "en",
+        "countryCode": "in",
         "exportPlaceUrls": False,
     }
-    headers = {"Content-Type": "application/json"}
     params = {"token": APIFY_TOKEN, "timeout": 120}
-
     try:
-        resp = requests.post(url, json=payload, headers=headers, params=params, timeout=180)
+        resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, params=params, timeout=180)
         if resp.status_code == 200:
-            return resp.json()
+            data = resp.json()
+            # Filter to only India results
+            india_results = []
+            for place in data:
+                address = place.get("address", "").lower()
+                if any(city_check in address for city_check in ["india", city["name"].lower(), "mumbai", "delhi", "bangalore", "bengaluru"]):
+                    india_results.append(place)
+                elif not any(foreign in address for foreign in ["new york", "london", "usa", "uk", "united states"]):
+                    india_results.append(place)
+            print(f"[Agent A] {city['name']}: {len(data)} total, {len(india_results)} in India")
+            return india_results
         else:
-            print(f"[Agent A] Apify error {resp.status_code}: {resp.text[:200]}")
+            print(f"[Agent A] Apify error {resp.status_code}")
             return []
     except Exception as e:
         print(f"[Agent A] Request failed: {e}")
@@ -37,23 +55,23 @@ def has_real_website(place):
     website = place.get("website", "")
     if not website:
         return False
-    # Filter out social media, maps links, empty sites
-    junk = ["facebook.com", "instagram.com", "justdial.com",
-            "sulekha.com", "indiamart.com", "maps.google", "google.com"]
+    junk = ["facebook.com", "instagram.com", "justdial.com", "sulekha.com",
+            "indiamart.com", "maps.google", "google.com", "magicbricks.com",
+            "99acres.com", "housing.com"]
     return not any(j in website.lower() for j in junk)
 
-def extract_lead(place, city):
+def extract_lead(place, city_name):
     phone = place.get("phone", "") or place.get("phoneUnformatted", "")
     return {
         "id": place.get("placeId", ""),
         "name": place.get("title", "Unknown"),
-        "city": city,
+        "city": city_name,
         "address": place.get("address", ""),
         "phone": phone,
         "email": place.get("email", ""),
         "rating": place.get("totalScore", 0),
         "reviews": place.get("reviewsCount", 0),
-        "category": place.get("categoryName", BUSINESS_TYPE),
+        "category": BUSINESS_TYPE,
         "maps_url": place.get("url", ""),
         "website": place.get("website", "NONE"),
         "has_website": has_real_website(place),
@@ -75,48 +93,34 @@ def save_leads(leads):
 def run():
     print(f"\n{'='*50}")
     print(f"[Agent A] Starting scan — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"[Agent A] Cities: {', '.join(CITIES)}")
-    print(f"[Agent A] Target: {BUSINESS_TYPE}")
+    print(f"[Agent A] Target: {BUSINESS_TYPE} in India")
     print(f"{'='*50}\n")
 
     existing = load_existing_leads()
     existing_ids = {l["id"] for l in existing}
-
     all_new_leads = []
 
     for city in CITIES:
-        results = search_google_maps(city, BUSINESS_TYPE)
-        print(f"[Agent A] {city}: Found {len(results)} places")
-
+        results = search_google_maps(city)
         for place in results:
-            lead = extract_lead(place, city)
-
-            # Skip if already found before
+            lead = extract_lead(place, city["name"])
             if lead["id"] in existing_ids:
                 continue
-
-            # Only keep businesses with NO real website
-            if not lead["has_website"]:
+            if not lead["has_website"] and lead["phone"]:
                 all_new_leads.append(lead)
-                print(f"  [LEAD] {lead['name']} — {lead['city']} — No website")
-
-        time.sleep(3)  # be polite between requests
+                print(f"  [LEAD] {lead['name']} — {lead['city']} — {lead['phone']}")
+        time.sleep(5)
 
     if all_new_leads:
         updated = existing + all_new_leads
         save_leads(updated)
-        print(f"\n[Agent A] {len(all_new_leads)} new leads found and saved.")
+        print(f"\n[Agent A] {len(all_new_leads)} new leads found.")
     else:
         print("\n[Agent A] No new leads this scan.")
 
-    # Write summary for Agent C to pick up
-    summary = {
-        "scan_time": datetime.now().isoformat(),
-        "new_leads_count": len(all_new_leads),
-        "new_leads": all_new_leads
-    }
+    os.makedirs("agent_a", exist_ok=True)
     with open("agent_a/latest_scan.json", "w") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+        json.dump({"scan_time": datetime.now().isoformat(), "new_leads_count": len(all_new_leads), "new_leads": all_new_leads}, f, indent=2, ensure_ascii=False)
 
     return all_new_leads
 
